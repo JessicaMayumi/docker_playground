@@ -6,7 +6,6 @@ import pandas as pd
 import os
 import logging
 
-# Configuracoes do DAG
 default_args = {
     'owner': 'dnc_insight',
     'depends_on_past': False,
@@ -17,7 +16,6 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-# Definicao do DAG
 dag = DAG(
     dag_id='data_pipeline_dag',
     default_args=default_args,
@@ -27,7 +25,6 @@ dag = DAG(
     tags=['data_pipeline', 'bronze', 'silver', 'gold']
 )
 
-# Funcao para carregar dados brutos na camada Bronze
 def upload_raw_data_to_bronze(**context):
     """
     Carrega dados brutos do CSV para a camada Bronze
@@ -109,52 +106,69 @@ def process_bronze_to_silver(**context):
 
 def process_silver_to_gold(**context):
     """
-    Processa dados da camada Silver para Gold com agregacoes e transformacoes
+    Processa dados da camada Silver para Gold com agregacoes otimizadas
     """
     try:
         silver_path = '/opt/airflow/data/silver/silver_data.csv'
         gold_path = '/opt/airflow/data/gold/gold_data.csv'
         
-        # Criar diretorio gold se nao existir
         os.makedirs(os.path.dirname(gold_path), exist_ok=True)
         
-        # Ler dados da camada Silver
         df = pd.read_csv(silver_path)
         
-        # Transformacoes para a camada Gold
-        # Criar faixas etarias
-        age_bins = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-        age_labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '90+']
+        # Otimizações de memória
+        df['age'] = df['age'].astype('int8')
+        df['subscription_status'] = df['subscription_status'].astype('category')
         
-        df['age_group'] = pd.cut(df['age'], bins=age_bins, labels=age_labels, right=False)
+        # Faixas etárias
+        age_bins = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120]
+        age_labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100', '100+']
         
-        aggregated_data = df.groupby(['age_group', 'subscription_status']).size().reset_index(name='user_count')
+        df['age_group'] = pd.cut(df['age'], bins=age_bins, labels=age_labels, right=False, include_lowest=True)
         
-        # Adicionar informacoes demograficas
-        demographic_summary = df.groupby('age_group').agg({
+        # Agregações
+        user_counts = df.groupby(['age_group', 'subscription_status'], observed=True).size()
+        aggregated_data = user_counts.reset_index(name='user_count')
+        
+        # Estatísticas demográficas
+        demographic_summary = df.groupby('age_group', observed=True).agg({
             'age': ['count', 'mean', 'min', 'max'],
             'subscription_status': lambda x: (x == 'active').sum()
         }).round(2)
         
         demographic_summary.columns = ['total_users', 'avg_age', 'min_age', 'max_age', 'active_users']
+        
+        # Métricas adicionais
         demographic_summary['inactive_users'] = demographic_summary['total_users'] - demographic_summary['active_users']
+        demographic_summary['active_percentage'] = (demographic_summary['active_users'] / demographic_summary['total_users'] * 100).round(2)
+        
+        max_users = demographic_summary['total_users'].max()
+        demographic_summary['data_quality_score'] = (demographic_summary['total_users'] / max_users * 100).round(2)
+        
+        # Estatísticas avançadas
+        demographic_summary['age_variance'] = df.groupby('age_group', observed=True)['age'].var().round(2)
+        demographic_summary['age_std'] = df.groupby('age_group', observed=True)['age'].std().round(2)
+        demographic_summary['age_25th'] = df.groupby('age_group', observed=True)['age'].quantile(0.25).round(2)
+        demographic_summary['age_75th'] = df.groupby('age_group', observed=True)['age'].quantile(0.75).round(2)
+        
         demographic_summary = demographic_summary.reset_index()
         
-        # Salvar dados agregados na camada Gold
+        # Salvar dados
         aggregated_data.to_csv(gold_path, index=False)
         
-        # Salvar resumo demografico
         demographic_path = '/opt/airflow/data/gold/demographic_summary.csv'
         demographic_summary.to_csv(demographic_path, index=False)
+        
         logging.info(f"Processamento Silver para Gold concluido:")
-        logging.info(f"  - Registros processados: {len(df)}")
+        logging.info(f"  - Registros processados: {len(df):,}")
         logging.info(f"  - Faixas etarias criadas: {len(age_labels)}")
-        logging.info(f"  - Agregacoes por status: {len(aggregated_data)}")
+        logging.info(f"  - Agregacoes por status: {len(aggregated_data):,}")
+        logging.info(f"  - Métricas demográficas: {len(demographic_summary.columns)} colunas")
         
-        # Retornar informacoes
         context['task_instance'].xcom_push(key='gold_count', value=len(aggregated_data))
+        context['task_instance'].xcom_push(key='gold_metrics', value=len(demographic_summary.columns))
         
-        return f"Sucesso: Dados transformados e salvos na camada Gold"
+        return f"Sucesso: Dados transformados e salvos na camada Gold com {len(demographic_summary.columns)} métricas"
         
     except Exception as e:
         logging.error(f"Erro ao processar dados da camada Silver para Gold: {str(e)}")
@@ -189,5 +203,4 @@ end_task = EmptyOperator(
     dag=dag
 )
 
-# Definicao das dependencias
 start_task >> bronze_task >> silver_task >> gold_task >> end_task
